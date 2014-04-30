@@ -5,10 +5,14 @@
 #include <sstream>
 #include <vector>
 #include <map>
+#include <set>
 #include <inttypes.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
+#include <cstring>
+#include <sys/types.h>
+#include <dirent.h>
 
 #include "constants.h"
 
@@ -54,9 +58,9 @@ enum IPType {
     IP_V6
 };
 
+// needed to use multimap with in6_addr&
 
-inline bool operator< (const in6_addr& lhs, const in6_addr& rhs)
-{
+inline bool operator<(const in6_addr& lhs, const in6_addr& rhs) {
     for (uint8_t i = 0; i < 16; ++i) {
         if (lhs.s6_addr[i] < rhs.s6_addr[i])
             return true;
@@ -64,31 +68,72 @@ inline bool operator< (const in6_addr& lhs, const in6_addr& rhs)
     return false;
 }
 
-
-void printFlow(struct flow* fl) {
+void printFlow(struct flow* fl, FILE* pFile) {
     char srcip[INET6_ADDRSTRLEN];
     char dstip[INET6_ADDRSTRLEN];
     inet_ntop(AF_INET6, &(fl->src_addr), srcip, INET6_ADDRSTRLEN);
     inet_ntop(AF_INET6, &(fl->dst_addr), dstip, INET6_ADDRSTRLEN);
-    fprintf(stdout, "%s:%d -> %s:%d, pkts: %" PRIi64" , bytes: %" PRIi64" \n", srcip, ntohs(fl->src_port), dstip, ntohs(fl->dst_port),
-            __builtin_bswap64(fl->packets),
-            __builtin_bswap64(fl->bytes));
+    fprintf(pFile, "%s:%d -> %s:%d, pkts: %" PRIi64" , bytes: %" PRIi64" \n", srcip, ntohs(fl->src_port), dstip, ntohs(fl->dst_port),
+            fl->packets,
+            fl->bytes);
 }
 
 template<typename T>
-void printFlow(std::multimap<T, flow> data) {
-    for (typename std::multimap<T, flow>::iterator ii = data.begin(); ii != data.end(); ++ii) {
-        printFlow(&ii->second);
+void printFlow(std::map<T, flow> data, const char* filename) {
+    FILE* pFile = fopen(filename, "w");
+    for (typename std::map<T, flow>::iterator ii = data.begin(); ii != data.end(); ++ii) {
+        printFlow(&ii->second, pFile);
     }
+    fclose(pFile);
 }
 
-in6_addr getMask(in6_addr const& address, uint8_t mask) {
-    in6_addr maskedIp;
+template<typename T>
+void printFlow(std::multimap<T, flow> data, const char* filename) {
+    FILE* pFile = fopen(filename, "w");
+    for (typename std::multimap<T, flow>::reverse_iterator ii = data.rbegin(); ii != data.rend(); ++ii) {
+        printFlow(&ii->second, pFile);
+    }
+    fclose(pFile);
+}
+
+in6_addr getMask(in6_addr const& address, uint8_t prefix, IPType const& ip) {
+    in6_addr mask, maskedIp;
+
+    memset(&maskedIp, 0, sizeof (struct in6_addr));
+    memset(&mask, 0, sizeof (struct in6_addr));
+
+    uint32_t tmpv4;
+    uint64_t tmpv6[2];
+    switch (ip) {
+        case IP_V4:
+            tmpv4 = ((uint32_t) (~0) << (32 - prefix));
+            memcpy(&mask.s6_addr[12], &tmpv4, sizeof (uint32_t));
+
+            for (uint8_t i = 12; i < 16; ++i)
+                maskedIp.s6_addr[i] = address.s6_addr[i] & mask.s6_addr[i];
+
+            break;
+        case IP_V6:
+            if (prefix <= 64) {
+                tmpv6[0] = ((uint64_t) (~0) << (64 - prefix));
+            } else {
+                prefix -= 64;
+                tmpv6[0] = (uint64_t) (~0);
+                tmpv6[1] = ((uint64_t) (~0) << (64 - prefix));
+            }
+            memcpy(mask.s6_addr, tmpv6, sizeof (uint64_t));
+            memcpy(&mask.s6_addr[8], &tmpv6[1], sizeof (uint64_t));
+
+            for (uint8_t i = 0; i < 16; ++i)
+                maskedIp.s6_addr[i] = address.s6_addr[i] & mask.s6_addr[i];
+
+            break;
+    }
 
     return maskedIp;
 }
 
-std::vector<std::string> split(std::string const& in, char delimiter = ' ') {
+std::vector<std::string> split(std::string const& in, char const& delimiter = ' ') {
     std::stringstream ss(in);
     std::string out;
     std::vector<std::string> tokens;
@@ -109,9 +154,9 @@ int main(int argc, char *argv[]) {
     if (argc < 3) {
         std::cerr << "Usage: " << argv[0] << "[-f filename]" << std::endl;
         return (EXIT_FAILURE);
-    }        
+    }
 
-    uint8_t aggr, sort, mask = 0;
+    uint8_t aggr, sort, prefix = 0;
     while ((opt = getopt(argc, argv, "f:a:s:")) != -1) {
         std::string arg(optarg);
 
@@ -122,28 +167,28 @@ int main(int argc, char *argv[]) {
                 break;
 
                 // aggregation type
-            case 'a':                
-                for (aggr = SRC_IP; aggr < MAX_AGGR; ++aggr) {                                                            
-                    if (arg.compare(AGGR_ARGS[aggr]) == 0) {                                              
+            case 'a':
+                for (aggr = SRC_IP; aggr < MAX_AGGR; ++aggr) {
+                    if (arg.compare(AGGR_ARGS[aggr]) == 0) {
                         if (aggr == SRC_IPV4 || aggr == SRC_IPV6 || aggr == DST_IPV4 || aggr == DST_IPV6) {
                             std::vector<std::string> tokens = split(arg, '/');
                             if (tokens[0].size() == AGGR_ARGS[aggr].size() && tokens.size() == 2) {
                                 if (aggr == SRC_IPV6 || aggr == DST_IPV6) {
-                                    mask = atoi(tokens[1].c_str());
-                                    if (mask > 1 && mask <= 128)
+                                    prefix = atoi(tokens[1].c_str());
+                                    if (prefix > 1 && prefix <= 128)
                                         break;
                                 } else if (aggr == SRC_IPV4 || aggr == DST_IPV4) {
-                                    mask = atoi(tokens[1].c_str());
-                                    if (mask > 1 && mask <= 32)
+                                    prefix = atoi(tokens[1].c_str());
+                                    if (prefix > 1 && prefix <= 32)
                                         break;
                                 }
                             }
-                        } else {                              
+                        } else {
                             if (arg.size() == AGGR_ARGS[aggr].size())
                                 break;
-                        }                        
+                        }
                     }
-                }                                
+                }
 
                 if (aggr == MAX_AGGR) {
                     std::cerr << "Usage: " << argv[0] << "[-f filename]" << std::endl;
@@ -153,7 +198,6 @@ int main(int argc, char *argv[]) {
 
                 // sort type    
             case 's':
-                uint8_t sort;
                 for (sort = PACKETS; sort < MAX_SORT; ++sort) {
                     if (compare(arg, SORT_ARGS[sort]) == 0)
                         break;
@@ -172,82 +216,200 @@ int main(int argc, char *argv[]) {
         }
     }
 
+    // reading file
+
+    DIR* dir = opendir(filename);
+    if (dir != NULL) {        
+        struct dirent* dp;
+        while ((dp = readdir(dir)) != NULL) {
+            std::string fn(dp->d_name);
+            std::string type(".bin");
+            size_t pos = fn.find(type);
+            if (pos != std::string::npos && pos + type.length() == fn.length()) { // also check if ext is really at the end
+                std::cout << dp->d_name << std::endl;
+            }            
+        }
+    }
+    closedir(dir);     
+
     std::ifstream f(filename, std::ifstream::in | std::ifstream::binary);
     if (!f) {
         std::cerr << "Unable to open file (filename: " << filename << ")." << std::endl;
         return EXIT_FAILURE;
     }
-    
+
+    std::map<in6_addr, flow> ipdata;
+    std::map<uint16_t, flow> portdata;
     switch (aggr) {
         case SRC_IP:
         {
-            std::multimap<in6_addr, flow> data;
             while (f.good()) {
                 flow fl;
                 f.read(reinterpret_cast<char*> (&fl), sizeof (flow));
-                data.insert(std::make_pair(fl.src_addr, fl));
-            }            
-            printFlow(data);
+                fl.bytes = __builtin_bswap64(fl.bytes);
+                fl.packets = __builtin_bswap64(fl.packets);
+
+                std::pair < std::map<in6_addr, flow>::iterator, bool> el = ipdata.insert(std::make_pair(fl.src_addr, fl));
+                if (!el.second) { // element already existed
+                    el.first->second.packets += fl.packets;
+                    el.first->second.bytes += fl.bytes;
+                }
+            }
             break;
         }
         case SRC_IPV4:
-        case SRC_IPV6:
         {
-            std::multimap<in6_addr, flow> data;
             while (f.good()) {
                 flow fl;
                 f.read(reinterpret_cast<char*> (&fl), sizeof (flow));
-                data.insert(std::make_pair(getMask(fl.src_addr, mask), fl));
-            }            
-            printFlow(data);
+                fl.bytes = __builtin_bswap64(fl.bytes);
+                fl.packets = __builtin_bswap64(fl.packets);
+
+                std::pair < std::map<in6_addr, flow>::iterator, bool> el = ipdata.insert(std::make_pair(getMask(fl.src_addr, prefix, IP_V4), fl));
+                if (!el.second) { // element already existed
+                    el.first->second.packets += fl.packets;
+                    el.first->second.bytes += fl.bytes;
+                }
+            }
+            break;
+        }
+        case SRC_IPV6:
+        {
+            while (f.good()) {
+                flow fl;
+                f.read(reinterpret_cast<char*> (&fl), sizeof (flow));
+                fl.bytes = __builtin_bswap64(fl.bytes);
+                fl.packets = __builtin_bswap64(fl.packets);
+
+                std::pair < std::map<in6_addr, flow>::iterator, bool> el = ipdata.insert(std::make_pair(getMask(fl.src_addr, prefix, IP_V6), fl));
+                if (!el.second) { // element already existed
+                    el.first->second.packets += fl.packets;
+                    el.first->second.bytes += fl.bytes;
+                }
+            }
             break;
         }
         case DST_IP:
         {
-            std::multimap<in6_addr, flow> data;
             while (f.good()) {
                 flow fl;
                 f.read(reinterpret_cast<char*> (&fl), sizeof (flow));
-                data.insert(std::make_pair(fl.dst_addr, fl));
-            }            
-            printFlow(data);
+                fl.bytes = __builtin_bswap64(fl.bytes);
+                fl.packets = __builtin_bswap64(fl.packets);
+
+                std::pair < std::map<in6_addr, flow>::iterator, bool> el = ipdata.insert(std::make_pair(fl.dst_addr, fl));
+                if (!el.second) { // element already existed
+                    el.first->second.packets += fl.packets;
+                    el.first->second.bytes += fl.bytes;
+                }
+            }
             break;
         }
-        case DST_IPV4:            
-        case DST_IPV6:
+        case DST_IPV4:
         {
-            std::multimap<in6_addr, flow> data;
             while (f.good()) {
                 flow fl;
                 f.read(reinterpret_cast<char*> (&fl), sizeof (flow));
-                data.insert(std::make_pair(getMask(fl.dst_addr, mask), fl));
-            }            
-            printFlow(data);
+                fl.bytes = __builtin_bswap64(fl.bytes);
+                fl.packets = __builtin_bswap64(fl.packets);
+
+                std::pair < std::map<in6_addr, flow>::iterator, bool> el = ipdata.insert(std::make_pair(getMask(fl.dst_addr, prefix, IP_V4), fl));
+                if (!el.second) {
+                    el.first->second.packets += fl.packets;
+                    el.first->second.bytes += fl.bytes;
+                }
+            }
+            break;
+        }
+        case DST_IPV6:
+        {
+            while (f.good()) {
+                flow fl;
+                f.read(reinterpret_cast<char*> (&fl), sizeof (flow));
+                fl.bytes = __builtin_bswap64(fl.bytes);
+                fl.packets = __builtin_bswap64(fl.packets);
+
+                std::pair < std::map<in6_addr, flow>::iterator, bool> el = ipdata.insert(std::make_pair(getMask(fl.dst_addr, prefix, IP_V6), fl));
+                if (!el.second) {
+                    el.first->second.packets += fl.packets;
+                    el.first->second.bytes += fl.bytes;
+                }
+            }
             break;
         }
         case SRC_PORT:
-        {            
-            std::multimap<uint16_t, flow> data;
+        {
             while (f.good()) {
                 flow fl;
                 f.read(reinterpret_cast<char*> (&fl), sizeof (flow));
-                data.insert(std::make_pair(fl.src_port, fl));
-            }            
-            printFlow(data);
+                fl.bytes = __builtin_bswap64(fl.bytes);
+                fl.packets = __builtin_bswap64(fl.packets);
+
+                std::pair < std::map<uint16_t, flow>::iterator, bool> el = portdata.insert(std::make_pair(fl.src_port, fl));
+                if (!el.second) {
+                    el.first->second.packets += fl.packets;
+                    el.first->second.bytes += fl.bytes;
+                }
+            }
             break;
         }
         case DST_PORT:
-        {            
-            std::multimap<uint16_t, flow> data;
+        {
             while (f.good()) {
                 flow fl;
                 f.read(reinterpret_cast<char*> (&fl), sizeof (flow));
-                data.insert(std::make_pair(fl.dst_port, fl));
-            }            
-            printFlow(data);
+                fl.bytes = __builtin_bswap64(fl.bytes);
+                fl.packets = __builtin_bswap64(fl.packets);
+
+                std::pair < std::map<uint16_t, flow>::iterator, bool> el = portdata.insert(std::make_pair(fl.dst_port, fl));
+                if (!el.second) {
+                    el.first->second.packets += fl.packets;
+                    el.first->second.bytes += fl.bytes;
+                }
+            }
             break;
         }
     }
+    std::multimap<uint64_t, flow> sorted;
+    switch (aggr) {
+        case SRC_IP:
+        case SRC_IPV4:
+        case SRC_IPV6:
+        case DST_IP:
+        case DST_IPV4:
+        case DST_IPV6:
+            switch (sort) {
+                case PACKETS:
+                    for (std::map<in6_addr, flow>::const_iterator ii = ipdata.begin(); ii != ipdata.end(); ++ii)
+                        sorted.insert(std::make_pair(ii->second.packets, ii->second));
+
+                    break;
+                case BYTES:
+                    for (std::map<in6_addr, flow>::const_iterator ii = ipdata.begin(); ii != ipdata.end(); ++ii)
+                        sorted.insert(std::make_pair(ii->second.bytes, ii->second));
+
+                    break;
+            }
+            break;
+        case SRC_PORT:
+        case DST_PORT:
+            switch (sort) {
+                case PACKETS:
+                    for (std::map<uint16_t, flow>::const_iterator ii = portdata.begin(); ii != portdata.end(); ++ii)
+                        sorted.insert(std::make_pair(ii->second.packets, ii->second));
+
+                    break;
+                case BYTES:
+                    for (std::map<uint16_t, flow>::const_iterator ii = portdata.begin(); ii != portdata.end(); ++ii)
+                        sorted.insert(std::make_pair(ii->second.bytes, ii->second));
+
+                    break;
+            }
+
+            break;
+    }
+    printFlow(sorted, "sorted.txt");
+
 
     f.close();
 
